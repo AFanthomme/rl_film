@@ -13,6 +13,7 @@ from torch.autograd import Variable
 import torchvision.transforms as T
 import random
 from gym.envs.classic_control import rendering
+import logging
 
 # GPU compatibility setup
 use_cuda = torch.cuda.is_available()
@@ -62,8 +63,7 @@ def check_params_changed(dict1, dict2):
         tmp1 = dict1[key]
         tmp2 = dict2[key]
         if np.max(np.abs(tmp1 - tmp2))==0:
-            print('No change in params {}'.format(key))
-
+            logging.warning('No change in params {}'.format(key))
 
 
 def write_json_config_file(filename='test', conv_shapes=[5,], dense_shapes=[],

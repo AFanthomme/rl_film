@@ -17,11 +17,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
 import torchvision.transforms as T
-
 from skvideo.io import FFmpegWriter as VideoWriter
-
 from utils import ReplayMemory, write_json_config_file, get_screen, Transition
 from utils import Flatten, check_params_changed, freeze_as_np_dict
+import logging
 
 
 # GPU compatibility setup
@@ -47,10 +46,9 @@ class DQN(nn.Module):
         self.n_channels = params['n_channels']
         self.output_size = params['n_out']
         self.batch_size = params['batch_size']
-        self.use_cuda = use_cuda
 
-        # For now, only support conv layers into dense head
 
+        # At least 1 conv, then dense head
         for idx, shape in enumerate(params['conv_shapes']):
             if idx == 0:
                 conv_layers.append(nn.Conv2d(self.n_channels, shape, kernel_size=3, stride=2))
@@ -60,21 +58,25 @@ class DQN(nn.Module):
             if params['use_batch_norm']:
                 conv_layers.append(nn.BatchNorm2d(shape))
             tmp = shape
-
         self.conv_layers = conv_layers
 
         # Infer shape after flattening
-
         tmp = self._get_conv_output_size([self.n_channels,] + self.input_resolution)
+
         for idx, shape in enumerate(params['dense_shapes'] + [self.output_size]):
             dense_layers.append(nn.Linear(tmp, shape))
             if idx < len(params['dense_shapes']):
                 dense_layers.append(nn.ReLU())
-            # if params['use_batch_norm']:
-            #     dense_layers.append(nn.BatchNorm2d(shape))
+                if params['use_batch_norm']:
+                    dense_layers.append(nn.BatchNorm2d(shape))
             tmp = shape
-
         self.dense_layers = dense_layers
+
+        logging.info('Model summary :')
+        for l in self.conv_layers:
+            logging.info(l)
+        for l in self.dense_layers:
+            logging.info(l)
 
 
     def _get_conv_output_size(self, shape):
@@ -100,15 +102,14 @@ class DQN(nn.Module):
         return self._forward_dense(x)
 
 
+
 class DQNagent(object):
     def __init__(self, filename='dqn0'):
-        "We assume discrete action-space, and boostrap Q values using only one net"
         self.filename = './trained_agents/'+filename
         self.policy_net = DQN(self.filename + '.cfg')
         self.target_net = DQN(self.filename + '.cfg')
         self.memory = ReplayMemory(16384)
         self.gamma = 0.999
-        self.use_cuda = use_cuda
 
     def select_action(self, state, epsilon):
         if np.random.rand() < epsilon:
@@ -117,9 +118,7 @@ class DQNagent(object):
             idx = self.policy_net(Variable(state, volatile=True).type(FloatTensor)).data.max(1)[1].view(1, 1)
         return idx
 
-    def update(self, batch_size=None):
-        if not batch_size:
-            batch_size = self.model.batch_size
+    def update(self, batch_size=16):
         if len(self.memory.memory) < batch_size:
             batch_size = len(self.memory.memory)
 
@@ -131,31 +130,25 @@ class DQNagent(object):
         reward_batch = Variable(torch.cat(batch.reward))
 
 
-        non_final_mask = ByteTensor(tuple(map(lambda s: s is not None,
-                                          batch.next_state)))
-        non_final_next_states = Variable(torch.cat([s for s in batch.next_state
-                                                if s is not None]), volatile=True)
+        non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
+        non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None]), volatile=True)
 
         state_action_values = self.policy_net(state_batch).gather(1, action_batch)
 
-        # Compute V(s_{t+1}) for all next states.
         next_state_values = Variable(torch.zeros(batch_size).type(Tensor))
         next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0]
-        # Compute the expected Q values
-        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
-        # Undo volatility (which was used to prevent unnecessary gradients)
-        expected_state_action_values = Variable(expected_state_action_values.data)
 
+        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
+        expected_state_action_values = Variable(expected_state_action_values.data)
 
         loss = F.mse_loss(state_action_values, expected_state_action_values)
 
-        # Optimize the model
+
         old_params = freeze_as_np_dict(self.policy_net.state_dict())
         self.optimizer.zero_grad()
         loss.backward()
-
         for param in self.policy_net.parameters():
-            # print(param.grad.data.sum())
+            logging.debug(param.grad.data.sum())
             param.grad.data.clamp_(-1., 1.)
         self.optimizer.step()
 
@@ -174,7 +167,7 @@ class DQNagent(object):
                 eps_decay = n_epochs // 4
             eps_range = [epsilon_init * math.exp(-1. * i / eps_decay) for i in range(n_epochs)]
 
-
+        history_file = open(self.filename + 'history', mode='a+')
         self.policy_net = self.policy_net.cuda()
         self.target_net = self.target_net.cuda()
         self.target_net.eval()
@@ -215,11 +208,11 @@ class DQNagent(object):
                 epoch_losses.append(loss)
                 epoch_rewards.append(reward)
 
-            print('Epoch {} : loss = {}, reward= {}, duration= {}'.format(epoch,
-                    np.mean(epoch_losses), np.sum(epoch_rewards), len(epoch_rewards)))
+            history_file.write('Epoch {}: loss= {}, reward= {}, duration= {}\n'.format(
+                epoch, np.mean(epoch_losses), np.sum(epoch_rewards), len(epoch_rewards)))
+
             losses.append(np.mean(epoch_losses))
             rewards.append(np.sum(epoch_rewards))
-
 
 
             if epoch % 10 == 1:
@@ -271,16 +264,14 @@ class DQNagent(object):
                 reward = Tensor([reward])
                 state = next_state
 
-
-            if verbose:
-                print('Test epoch {} :  reward= {}, duration= {}'.format(epoch,
+                logging.debug('Test epoch {} :  reward= {}, duration= {}'.format(epoch,
                      np.sum(epoch_rewards), len(epoch_rewards)))
             rewards.append(np.sum(epoch_rewards))
 
             if epoch % 5 == 0:
                 self.make_video(video, ext='_test_' + str(epoch))
 
-            print('Performance estimate : {} pm {}'.format(np.mean(rewards), np.std(rewards)))
+            logging.info('Performance estimate : {} pm {}'.format(np.mean(rewards), np.std(rewards)))
 
 
     def make_video(self, replay, ext=''):
@@ -298,23 +289,3 @@ class DQNagent(object):
     def load(self, filename):
         self.policy_net.load_state_dict(torch.load('./trained_agents/'+filename+'.pol.ckpt'))
         self.target_net.load_state_dict(torch.load('./trained_agents/'+filename+'.tgt.ckpt'))
-
-if __name__ == '__main__':
-    env = gym.make('CartPole-v0')
-    print(env.action_space)
-    n_actions=2
-
-    env.reset()
-    resolution = [get_screen(env).shape[2], get_screen(env).shape[3]]
-    write_json_config_file('dqn_cartpole_', input_resolution=resolution,
-                n_out=n_actions, conv_shapes=[16, 32, 32], dense_shapes=[])
-    agent = DQNagent('dqn_cartpole_')
-
-
-    agent.train(env, 500, lr=0.001, epsilon_init=0.05, epsilon_schedule='exp', batch_size=128)
-    print('\nTest initial model')
-    agent.load('dqn_cartpole_1')
-    agent.test(env, 200, verbose=False)
-    print('\nTest trained model')
-    agent.load('dqn_cartpole_491')
-    agent.test(env, 200, verbose=False)
