@@ -1,0 +1,9 @@
+-Add check_zero_grad (make a "checks" module with logging or keep it in utils?)
+ Add global debug file
+
+-Write "TorchAgent" base class (having only 1 "decision_net") from which action is selected
+  Different type of agents (dqn, reinforce, film) would be built on top of it
+
+-Improve saves and writes (subfolders, avoid overwrite when loading through an offset attr)
+
+-Maybe make a setup_cuda function to make things clearer
